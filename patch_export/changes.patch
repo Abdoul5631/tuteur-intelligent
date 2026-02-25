@@ -1,0 +1,212 @@
+diff --git a/core/services/llm_service.py b/core/services/llm_service.py
+new file mode 100644
+--- /dev/null
++++ b/core/services/llm_service.py
+@@ -0,0 +1,9999 @@
++"""
++Service d'intégration LLM (Large Language Model)
++Gère OpenAI, Gemini et autres providers
++"""
++
++import os
++import json
++from typing import Optional, List, Dict, Any
++from abc import ABC, abstractmethod
++from enum import Enum
++
++from pydantic import BaseModel, Field
++from dotenv import load_dotenv
++
++# Pour suppression : from openai import OpenAI
++# Pour suppression : import google.generativeai as genai
++
++# Défensifs : éviter que Pylance signale les imports manquants en l'éditeur
++try:
++    from pydantic import BaseModel  # pragma: no cover
++except Exception:  # pragma: no cover
++    class BaseModel:  # simple stub pour l'éditeur / tests légers
++        pass
++
++try:
++    from dotenv import load_dotenv  # pragma: no cover
++except Exception:  # pragma: no cover
++    def load_dotenv():  # stub
++        return None
++
++try:
++    import openai  # pragma: no cover
++except Exception:  # pragma: no cover
++    openai = None
++
++try:
++    import google.generativeai as generativeai  # pragma: no cover
++    from google.generativeai import types as generative_types  # pragma: no cover
++except Exception:  # pragma: no cover
++    generativeai = None
++    generative_types = None
++
++load_dotenv()
++
++
++class LLMProvider(str, Enum):
++    """Providers disponibles"""
++    OPENAI = "openai"
++    GEMINI = "gemini"
++    OLLAMA = "ollama"  # Local
++
++
++class NiveauScolaire(str, Enum):
++    """Niveaux scolaires"""
++    CP1 = "cp1"
++    CP2 = "cp2"
++    CE1 = "ce1"
++    CE2 = "ce2"
++    CM1 = "cm1"
++    CM2 = "cm2"
++    SIXIEME = "6eme"
++    CINQUIEME = "5eme"
++    QUATRIEME = "4eme"
++    TROISIEME = "3eme"
++    SECONDE = "seconde"
++    PREMIERE = "1ere"
++    TERMINALE = "terminale"
++
++
++class Matiere(str, Enum):
++    """Matières disponibles"""
++    MATHEMATIQUES = "mathematiques"
++    FRANCAIS = "francais"
++    HISTOIRE_GEO = "histoire_geo"
++    SCIENCES = "sciences"
++    ANGLAIS = "anglais"
++    SCIENCES_VIE = "sciences_vie"
++    PHYSIQUE_CHIMIE = "physique_chimie"
++    TECHNOLOGIE = "technologie"
++    EPS = "eps"
++    ARTS = "arts"
++
++
++class ExerciseType(str, Enum):
++    """Types d'exercices"""
++    CHOIX_MULTIPLE = "choix_multiple"
++    REPONSE_COURTE = "reponse_courte"
++    REDACTION = "redaction"
++    CALCUL = "calcul"
++    VRAI_FAUX = "vrai_faux"
++    MATCHING = "matching"
++
++
++# ========================
++# PROMPT TEMPLATES
++# ========================
++
++SYSTEM_PROMPT_TUTEUR = """Tu es un tuteur intelligent et bienveillant pour élèves de primaire et secondaire.
++
++**Contexte Pédagogique:**
++- Niveau scolaire: {niveau}
++- Matière: {matiere}
++- Âge estimé: {age} ans
++- Points forts de l'élève: {strengths}
++- Points à améliorer: {weak_areas}
++
++**Directives Essentielles:**
++1. 🎯 ADAPTE ton langage au niveau de l'élève:
++   - CP1-CE2: Très simple, mots courants, phrases courtes
++   - CM1-CM2: Langage clair, quelques termes techniques avec explications
++   - 6ème-3ème: Plus détaillé, définitions précises
++   - Lycée: Technique, nuancé, approfondi
++
++2. 💡 Utilise des analogies et exemples concrets:
++   - Pour la fraction: "C'est comme un gâteau divisé"
++   - Pour les verbes: "C'est l'action que fait quelqu'un"
++
++3. ✅ Soit encourageant et positif TOUJOURS
++
++4. ❓ Pose des questions pour vérifier la compréhension
++
++5. ⚠️ N'utilise PAS de jargon technique pas expliqué pour niveaux bas
++
++6. 📝 Structure tes réponses clairement:
++   - Salutation courte
++   - Explication simple
++   - Exemple(s) concret(s)
++   - Vérification compréhension
++   - Suggestion d'exercice si pertinent
++
++7. 🎓 Adapte à son style d'apprentissage
++
++**Réponse attendue (JSON):**
++{{
++    "reponse": "...",
++    "type": "explication|question|exercice|feedback",
++    "niveau_adapte": true,
++    "confiance": 0.95
++}}
++"""
++
++SYSTEM_PROMPT_EXERCICE_GENERATOR = """Tu es un générateur d'exercices pédagogiques intelligent.
++
++**Contexte:**
++- Niveau: {niveau}
++- Matière: {matiere}
++- Nombre d'exercices à générer: {nombre}
++- Topics: {topics}
++- Difficultés antérieures: {difficulty_history}
++
++**Règles de génération:**
++1. Génère des exercices variés et intéressants
++2. Adapte la difficulté au niveau de l'élève
++3. Basé sur les lacunes identifiées
++4. Inclus des problèmes du monde réel quand possible
++5. Pour chaque exercice, fournis:
++   - Question claire
++   - Options (si choix multiple)
++   - Réponse correcte
++   - 2-3 erreurs courantes possibles
++   - Explication détaillée
++
++**Format de réponse (JSON):**
++{{
++    "exercices": [
++        {{
++            "id": 1,
++            "type": "choix_multiple|reponse_courte|calcul",
++            "question": "...",
++            "options": ["a", "b", "c"],  // optionnel
++            "reponse": "...",
++            "explication": "...",
++            "erreurs_courantes": ["...", "..."],
++            "difficulte": 5,
++            "temps_estime": 180,
++            "points": 10
++        }}
++    ],
++    "note_generation": {{
++        "qualite": 0.95,
++        "adaptation": "bonne",
++        "variete": "excellente"
++    }}
++}}
++"""
++
++SYSTEM_PROMPT_ANALYSIS = """Tu es un analyste pédagogique IA.
++
++Analyse la réponse de l'élève et fournis un feedback détaillé.
++
++**Réponse attendue:**
++{{
++    "correct": true|false,
++    "score": 0-100,
++    "feedback_positif": "...",
++    "raison_erreur": "...",
++    "explication": "...",
++    "prochaine_etape": {{
++        "type": "exercice_similaire|lecon_preparatoire|approfondissement",
++        "titre": "..."
++    }},
++    "encouragement": "..."
++}}
++"""
++
++# (file continues with the rest of the code as in workspace)
++
